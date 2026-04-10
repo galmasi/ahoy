@@ -1,0 +1,32 @@
+{
+  "sshkey": "/Users/galmasi/.ssh/id_rsa",
+  "sshoptions": "-oUserKnownHostsFile=/dev/null -oStrictHostKeyChecking=no -oBatchMode=yes -oPasswordAuthentication=no -oConnectTimeout=20",
+  "sshuttlecmd": "sshuttle --disable-ipv6 --dns --python python3",
+  "networks": {
+      "31lab": {
+	  "jumphost": "galmasi@9.2.220.22",
+          "gateway": "10.20.0.1",
+	  "nets": [ "10.20.0.0/16", "10.30.0.0/16" ]
+      },
+      "Ykt": {
+	  "jumphost": "galmasi@9.2.130.16",
+          "gateway": "100.64.0.1",
+	  "nets": [ "192.168.16.0/22", "100.64.0.1/16", "10.42.0.0/16" ]
+      },
+      "gaptooth": {
+	  "jumphost": "galmasi@9.47.228.121",
+          "gateway": "192.168.76.1",
+	  "nets": [ "192.168.76.0/22" ]
+      },
+      "fusiony": {
+	  "jumphost": "galmasi@9.47.228.15",
+          "gateway": "192.168.92.1",
+	  "nets": [ "192.168.92.0/22", "169.253.0.0/16" ]
+      },
+      "pokprod": {
+	  "jumphost": "galmasi@9.47.228.16",
+          "gateway": "192.168.96.1",
+	  "nets": [ "192.168.96.0/22" ]
+      }
+  }
+}
