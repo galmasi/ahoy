@@ -5,6 +5,8 @@ import subprocess
 import threading
 import time
 import json
+import os
+import sys
 from dataclasses import dataclass
 from typing import Optional
 
@@ -32,8 +34,24 @@ class ToggleItem:
 # Edit this list to add your own toggles.
 ITEMS: list[ToggleItem] = []
 
-fp = open('config.json', 'rb')
-d = json.load(fp)
+_CONFIG_PATHS = [
+    os.path.expanduser("~/.config/ahoy/config.json"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
+]
+
+def _load_config() -> dict:
+    for path in _CONFIG_PATHS:
+        if os.path.exists(path):
+            with open(path, "rb") as fp:
+                return json.load(fp)
+    print(
+        "ahoy: config not found.\n"
+        "Copy config.example.json to ~/.config/ahoy/config.json and edit it.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+d = _load_config()
 for netname in d['networks'].keys():
     network=d['networks'][netname]
     label = netname
