@@ -2,13 +2,11 @@
 
 import curses
 import subprocess
+import threading
 import time
 import json
 from dataclasses import dataclass
 from typing import Optional
-
-
-POLL_INTERVAL = 30   # seconds between automatic check_cmd refreshes
 
 # ── colour pair indices ────────────────────────────────────────────────
 CP_ON     = 1   # green  — ON
@@ -24,12 +22,12 @@ CP_NOSYNC = 5   # red    — desired differs from actual
 class ToggleItem:
     label: str
     description: str
-    check_cmd: str    # shell cmd: exit 0 → ON,  non-zero → OFF
-    on_cmd: str       # shell cmd: executed to turn ON
-    off_cmd: str      # shell cmd: executed to turn OFF
-    desired: bool = False
+    check_cmd: str                 # shell cmd: exit 0 → ON,  non-zero → OFF
+    on_cmd: str                    # shell cmd: executed to turn ON
+    off_cmd: str                   # shell cmd: executed to turn OFF
+    desired: Optional[bool] = None # None = unset (before startup)
     actual: Optional[bool] = None  # None = not yet queried
-
+    message: str = ""              # output from an error
 
 # Edit this list to add your own toggles.
 ITEMS: list[ToggleItem] = []
@@ -50,7 +48,7 @@ for netname in d['networks'].keys():
     item = ToggleItem(label, description, check_cmd, on_cmd, off_cmd)
     ITEMS.append(item)
 
-# ── shell helpers ─────────────────────────────────────────────────────
+# ── model ──────────────────────────────────────────────────
 
 def _run(cmd: str) -> int:
     return subprocess.call(
@@ -59,40 +57,25 @@ def _run(cmd: str) -> int:
         stderr=subprocess.DEVNULL,
     )
 
-
-def check_state(item: ToggleItem) -> bool:
+def model_check_state(item: ToggleItem) -> bool:
     """Return True (ON) if check_cmd exits 0, False otherwise."""
     return _run(item.check_cmd) == 0
 
-
-def startup_refresh() -> None:
-    """Query every item and align desired to match actual."""
-    for item in ITEMS:
-        item.actual  = check_state(item)
-        item.desired = item.actual
-
-
-def refresh_all() -> None:
-    """Re-query actual state for every item."""
-    for item in ITEMS:
-        item.actual = check_state(item)
-
-
-def apply_item(item: ToggleItem) -> str:
+def model_update_loop() -> None:
+    while True:
+        for item in ITEMS:
+            item.actual  = model_check_state(item)
+            if item.desired is None:
+                item.desired = item.actual
+            if item.actual != item.desired:
+                model_apply_item(item)
+        time.sleep(1)
+        
+def model_apply_item(item: ToggleItem) -> str:
     """Run on_cmd or off_cmd to reach desired state; return a status string."""
     cmd = item.on_cmd if item.desired else item.off_cmd
     rc  = _run(cmd)
-    item.actual = check_state(item)
-    state  = "ON"  if item.desired else "OFF"
-    status = "OK"  if rc == 0      else f"exit {rc}"
-    return f"[{status}] '{item.label}' → {state}"
-
-
-def apply_all() -> str:
-    """Apply desired state for every item that is out of sync."""
-    msgs = [apply_item(i) for i in ITEMS if i.actual != i.desired]
-    return "  |  ".join(msgs) if msgs else "All items already in sync."
-
+    item.actual = model_check_state(item)
 
 # ── layout constants ──────────────────────────────────────────────────
 
@@ -102,7 +85,6 @@ COL_ACTUAL  = 32
 COL_SYNC    = 40
 TABLE_MIN_W = 50
 ROW_ITEMS   =  2   # first data row inside the table window
-
 
 # ── drawing ───────────────────────────────────────────────────────────
 
@@ -133,7 +115,7 @@ def draw_item(win, row: int, item: ToggleItem,
         win.addstr(row, COL_ACTUAL,  _badge(item.actual),
                    _badge_attr(item.actual,  base, use_colors))
 
-        if item.actual is None:
+        if item.actual is None or item.desired is None:
             sync_s = " ?  "
             sync_a = _badge_attr(None, base, use_colors)
         elif item.desired == item.actual:
@@ -181,9 +163,7 @@ def draw_info(win, highlight: int, log: str) -> None:
 
 def draw_header(stdscr, cols: int) -> None:
     title = "Ahoy! number, please"
-    hint  = ("SPACE/ENTER: toggle desired   "
-             "a: apply current   A: apply all   "
-             "r: refresh actual   q: quit")
+    hint  = ("SPACE/ENTER: toggle desired q: quit")
     try:
         stdscr.addstr(0, max(0, (cols - len(title)) // 2), title,
                       curses.A_BOLD | curses.A_UNDERLINE)
@@ -196,6 +176,12 @@ def draw_header(stdscr, cols: int) -> None:
 # ── main ──────────────────────────────────────────────────────────────
 
 def main(stdscr) -> None:
+
+    # start the status updater
+    thread = threading.Thread(target=model_update_loop, args=(), daemon=True)
+    thread.start()
+
+    # draw the window
     curses.curs_set(0)
     stdscr.clear()
     curses.noecho()
@@ -223,16 +209,15 @@ def main(stdscr) -> None:
     table_win = curses.newwin(table_h, table_w, table_start, 2)
     info_win  = curses.newwin(info_h,  table_w, info_start,  2)
     table_win.keypad(True)
-    table_win.timeout(500)   # getch() returns -1 after 500 ms with no key
+    table_win.timeout(100)   # getch() returns -1 after 100 ms with no key
+    POLL_INTERVAL = 2        # seconds between automatic display redraws
 
     highlight = 0
-    log       = "Querying actual states…"
+    log       = "Initializing…"
     draw_header(stdscr, cols)
     draw_table(table_win, highlight, use_colors)
     draw_info(info_win, highlight, log)
 
-    startup_refresh()
-    log = "Ready. Desired state initialised to match actual."
     last_poll = time.monotonic()
 
     draw_table(table_win, highlight, use_colors)
@@ -241,15 +226,14 @@ def main(stdscr) -> None:
     while True:
         ch = table_win.getch()   # returns -1 on timeout
 
-        # ── periodic auto-refresh ──────────────────────────────────────
+        # ── periodic display auto-refresh ──────────────────────────────────────
         now = time.monotonic()
         if now - last_poll >= POLL_INTERVAL:
-            refresh_all()
             last_poll = now
             log = f"Auto-refreshed  ({time.strftime('%H:%M:%S')})"
             draw_table(table_win, highlight, use_colors)
             draw_info(info_win, highlight, log)
-
+            
         if ch == -1:   # timeout tick — nothing more to do
             continue
 
@@ -262,31 +246,30 @@ def main(stdscr) -> None:
         elif ch in (ord(' '), 10, 13, curses.KEY_ENTER):
             ITEMS[highlight].desired = not ITEMS[highlight].desired
             state = "ON" if ITEMS[highlight].desired else "OFF"
-            log = (f"Desired: '{ITEMS[highlight].label}' → {state}"
-                   "  (press a to apply)")
+            log = (f"Desired: '{ITEMS[highlight].label}' → {state}")
 
-        elif ch == ord('a'):
-            item = ITEMS[highlight]
-            if item.actual == item.desired:
-                log = f"'{item.label}' is already in the desired state."
-            else:
-                log = f"Applying '{item.label}'…"
-                draw_info(info_win, highlight, log)
-                log = apply_item(item)
+        #elif ch == ord('a'):
+        #    item = ITEMS[highlight]
+        #    if item.actual == item.desired:
+        #        log = f"'{item.label}' is already in the desired state."
+        #    else:
+        #        log = f"Applying '{item.label}'…"
+        #        draw_info(info_win, highlight, log)
+        #        log = apply_item(item)
 
-        elif ch == ord('A'):
-            if all(i.actual == i.desired for i in ITEMS):
-                log = "All items already in sync."
-            else:
-                log = "Applying all out-of-sync items…"
-                draw_info(info_win, highlight, log)
-                log = apply_all()
+        #elif ch == ord('A'):
+        #    if all(i.actual == i.desired for i in ITEMS):
+        #        log = "All items already in sync."
+        #    else:
+        #        log = "Applying all out-of-sync items…"
+        #        draw_info(info_win, highlight, log)
+        #        log = apply_all()
 
-        elif ch == ord('r'):
-            log = "Refreshing actual states…"
-            draw_info(info_win, highlight, log)
-            refresh_all()
-            log = "Actual states refreshed."
+        #elif ch == ord('r'):
+        #    log = "Refreshing actual states…"
+        #    draw_info(info_win, highlight, log)
+        #    refresh_all()
+        #    log = "Actual states refreshed."
 
         elif ch in (ord('q'), ord('Q')):
             break
