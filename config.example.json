@@ -1,0 +1,17 @@
+{
+  "sshkey": "~/.ssh/id_rsa",
+  "sshoptions": "-oUserKnownHostsFile=/dev/null -oStrictHostKeyChecking=no -oBatchMode=yes -oPasswordAuthentication=no -oConnectTimeout=20",
+  "sshuttlecmd": "sshuttle --disable-ipv6 --dns --python python3",
+  "networks": {
+    "mylab": {
+      "jumphost": "user@jumphost.example.com",
+      "gateway": "10.0.0.1",
+      "nets": [ "10.0.0.0/16" ]
+    },
+    "office": {
+      "jumphost": "user@office-bastion.example.com",
+      "gateway": "192.168.1.1",
+      "nets": [ "192.168.1.0/24", "10.10.0.0/16" ]
+    }
+  }
+}
