@@ -7,8 +7,21 @@ import time
 import json
 import os
 import sys
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
+
+LOG_MAX_LINES = 400
+MAX_CMD_LOG_CHARS = 400
+MAX_LOG_LINE_CHARS = 512
+
+_command_log: deque[str] = deque(maxlen=LOG_MAX_LINES)
+_command_log_lock = threading.Lock()
+
+
+def command_log_snapshot() -> list[str]:
+    with _command_log_lock:
+        return list(_command_log)
 
 # ── colour pair indices ────────────────────────────────────────────────
 CP_ON     = 1   # green  — ON
@@ -75,6 +88,43 @@ def _run(cmd: str) -> int:
         stderr=subprocess.DEVNULL,
     )
 
+
+def _run_toggle_apply(item: ToggleItem) -> int:
+    """Run on_cmd or off_cmd per `item.desired`; capture output into `_command_log`."""
+    turning_on = bool(item.desired)
+    cmd = item.on_cmd if turning_on else item.off_cmd
+    phase = "ON" if turning_on else "OFF"
+    ts = time.strftime("%H:%M:%S")
+    try:
+        completed = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+    except OSError as exc:
+        line_a = f"[{ts}] {item.label} → {phase}  (failed to run: {exc})"
+        line_b = f"  $ {cmd.strip()[:MAX_CMD_LOG_CHARS]}"
+        with _command_log_lock:
+            _command_log.append(line_a)
+            _command_log.append(line_b)
+        return 127
+
+    rc = completed.returncode
+    out = (completed.stdout or "") + (completed.stderr or "")
+    header = f"[{ts}] {item.label} → {phase}  exit {rc}"
+    with _command_log_lock:
+        _command_log.append(header)
+        _command_log.append(f"  $ {cmd.strip()[:MAX_CMD_LOG_CHARS]}")
+        lines = out.splitlines()
+        if not lines and rc != 0:
+            _command_log.append("  (no stdout/stderr)")
+        for raw in lines:
+            _command_log.append(f"  | {raw[:MAX_LOG_LINE_CHARS]}")
+    return rc
+
+
 def model_check_state(item: ToggleItem) -> bool:
     """Return True (ON) if check_cmd exits 0, False otherwise."""
     return _run(item.check_cmd) == 0
@@ -89,10 +139,9 @@ def model_update_loop() -> None:
                 model_apply_item(item)
         time.sleep(1)
         
-def model_apply_item(item: ToggleItem) -> str:
-    """Run on_cmd or off_cmd to reach desired state; return a status string."""
-    cmd = item.on_cmd if item.desired else item.off_cmd
-    rc  = _run(cmd)
+def model_apply_item(item: ToggleItem) -> None:
+    """Run on_cmd or off_cmd to reach desired state (apply path is logged)."""
+    _run_toggle_apply(item)
     item.actual = model_check_state(item)
 
 # ── layout constants ──────────────────────────────────────────────────
@@ -102,6 +151,7 @@ COL_DESIRED = 24
 COL_ACTUAL  = 32
 COL_SYNC    = 40
 TABLE_MIN_W = 50
+LOG_MIN_H   =  5   # minimum height (incl. border) for the command log panel
 ROW_ITEMS   =  2   # first data row inside the table window
 
 # ── drawing ───────────────────────────────────────────────────────────
@@ -179,6 +229,25 @@ def draw_info(win, highlight: int, log: str) -> None:
     win.refresh()
 
 
+def draw_log(win, lines: list[str]) -> None:
+    """Bordered panel for captured command output (body filled by `lines`)."""
+    h, w = win.getmaxyx()
+    win.erase()
+    win.box()
+    win.addstr(0, 3, " Command log ", curses.A_BOLD)
+    body_rows = max(0, h - 2)
+    if body_rows == 0:
+        win.refresh()
+        return
+    display = lines if lines else ["(no output yet)"]
+    try:
+        for i in range(min(len(display), body_rows)):
+            win.addstr(1 + i, 2, display[i][: max(0, w - 4)], curses.A_DIM)
+    except curses.error:
+        pass
+    win.refresh()
+
+
 def draw_header(stdscr, cols: int) -> None:
     title = "Ahoy! number, please"
     hint  = ("SPACE/ENTER: toggle desired q: quit")
@@ -223,9 +292,17 @@ def main(stdscr) -> None:
     info_h       = 4
     table_start  = 2
     info_start   = table_start + table_h + 1
+    log_y        = info_start + info_h + 1
+    avail        = rows - log_y
+    log_h        = min(max(LOG_MIN_H, avail - 1), avail) if avail > 0 else 0
+    if log_h > 0 and log_y + log_h > rows:
+        log_h = rows - log_y
 
     table_win = curses.newwin(table_h, table_w, table_start, 2)
     info_win  = curses.newwin(info_h,  table_w, info_start,  2)
+    log_win   = (
+        curses.newwin(log_h, table_w, log_y, 2) if log_h >= 3 else None
+    )
     table_win.keypad(True)
     table_win.timeout(100)   # getch() returns -1 after 100 ms with no key
     POLL_INTERVAL = 2        # seconds between automatic display redraws
@@ -235,11 +312,15 @@ def main(stdscr) -> None:
     draw_header(stdscr, cols)
     draw_table(table_win, highlight, use_colors)
     draw_info(info_win, highlight, log)
+    if log_win is not None:
+        draw_log(log_win, command_log_snapshot())
 
     last_poll = time.monotonic()
 
     draw_table(table_win, highlight, use_colors)
     draw_info(info_win, highlight, log)
+    if log_win is not None:
+        draw_log(log_win, command_log_snapshot())
 
     while True:
         ch = table_win.getch()   # returns -1 on timeout
@@ -251,7 +332,9 @@ def main(stdscr) -> None:
             log = f"Auto-refreshed  ({time.strftime('%H:%M:%S')})"
             draw_table(table_win, highlight, use_colors)
             draw_info(info_win, highlight, log)
-            
+            if log_win is not None:
+                draw_log(log_win, command_log_snapshot())
+
         if ch == -1:   # timeout tick — nothing more to do
             continue
 
@@ -294,6 +377,8 @@ def main(stdscr) -> None:
 
         draw_table(table_win, highlight, use_colors)
         draw_info(info_win, highlight, log)
+        if log_win is not None:
+            draw_log(log_win, command_log_snapshot())
 
 
 if __name__ == "__main__":
