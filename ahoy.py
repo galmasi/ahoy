@@ -15,13 +15,47 @@ LOG_MAX_LINES = 400
 MAX_CMD_LOG_CHARS = 400
 MAX_LOG_LINE_CHARS = 512
 
+COMMAND_LOG_PATH = os.path.join(
+    os.path.expanduser("~/.local/state/ahoy"),
+    "command.log",
+)
+
 _command_log: deque[str] = deque(maxlen=LOG_MAX_LINES)
 _command_log_lock = threading.Lock()
+_command_log_file_warned = False
 
 
 def command_log_snapshot() -> list[str]:
     with _command_log_lock:
         return list(_command_log)
+
+
+def _persist_command_log_lines(lines: list[str]) -> None:
+    """Append log lines to disk (same content as the on-screen deque)."""
+    global _command_log_file_warned
+    if not lines:
+        return
+    path = COMMAND_LOG_PATH
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fp:
+            for line in lines:
+                fp.write(line + "\n")
+            fp.flush()
+    except OSError as exc:
+        if not _command_log_file_warned:
+            print(
+                f"ahoy: cannot write command log to {path}: {exc}",
+                file=sys.stderr,
+            )
+            _command_log_file_warned = True
+
+
+def _command_log_extend(entries: list[str]) -> None:
+    with _command_log_lock:
+        for line in entries:
+            _command_log.append(line)
+    _persist_command_log_lines(entries)
 
 # ── colour pair indices ────────────────────────────────────────────────
 CP_ON     = 1   # green  — ON
@@ -90,7 +124,7 @@ def _run(cmd: str) -> int:
 
 
 def _run_toggle_apply(item: ToggleItem) -> int:
-    """Run on_cmd or off_cmd per `item.desired`; capture output into `_command_log`."""
+    """Run on_cmd or off_cmd per `item.desired`; capture output into `_command_log` and file."""
     turning_on = bool(item.desired)
     cmd = item.on_cmd if turning_on else item.off_cmd
     phase = "ON" if turning_on else "OFF"
@@ -104,24 +138,27 @@ def _run_toggle_apply(item: ToggleItem) -> int:
             errors="replace",
         )
     except OSError as exc:
-        line_a = f"[{ts}] {item.label} → {phase}  (failed to run: {exc})"
-        line_b = f"  $ {cmd.strip()[:MAX_CMD_LOG_CHARS]}"
-        with _command_log_lock:
-            _command_log.append(line_a)
-            _command_log.append(line_b)
+        _command_log_extend(
+            [
+                f"[{ts}] {item.label} → {phase}  (failed to run: {exc})",
+                f"  $ {cmd.strip()[:MAX_CMD_LOG_CHARS]}",
+            ]
+        )
         return 127
 
     rc = completed.returncode
     out = (completed.stdout or "") + (completed.stderr or "")
     header = f"[{ts}] {item.label} → {phase}  exit {rc}"
-    with _command_log_lock:
-        _command_log.append(header)
-        _command_log.append(f"  $ {cmd.strip()[:MAX_CMD_LOG_CHARS]}")
-        lines = out.splitlines()
-        if not lines and rc != 0:
-            _command_log.append("  (no stdout/stderr)")
-        for raw in lines:
-            _command_log.append(f"  | {raw[:MAX_LOG_LINE_CHARS]}")
+    entries = [
+        header,
+        f"  $ {cmd.strip()[:MAX_CMD_LOG_CHARS]}",
+    ]
+    out_lines = out.splitlines()
+    if not out_lines and rc != 0:
+        entries.append("  (no stdout/stderr)")
+    for raw in out_lines:
+        entries.append(f"  | {raw[:MAX_LOG_LINE_CHARS]}")
+    _command_log_extend(entries)
     return rc
 
 
