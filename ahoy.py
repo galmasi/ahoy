@@ -7,9 +7,172 @@ import time
 import json
 import os
 import sys
+from datetime import datetime
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
+
+# ── data model ────────────────────────────────────────────────────────
+
+@dataclass
+class ToggleItem:
+    label: str
+    description: str
+    check_cmd: str                 # shell cmd: exit 0 → ON,  non-zero → OFF
+    on_cmd: str                    # shell cmd: executed to turn ON
+    off_cmd: str                   # shell cmd: executed to turn OFF
+    desired: Optional[bool] = None # None = unset (before startup)
+    actual: Optional[bool] = None  # None = not yet queried
+    message: str = ""              # output from an error
+
+# Edit this list to add your own toggles.
+ITEMS: list[ToggleItem] = []
+
+_CONFIG_PATHS = [
+    os.path.expanduser("~/.config/ahoy/config.json"),
+    os.path.expanduser("~/Library/Application Support/ahoy/config.json"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
+]
+
+_CHECK_SSHOPTS_DEFAULT="-oBatchMode=yes -oPasswordAuthentication=no -oUserKnownHostsFile=/dev/null -oStrictHostKeyChecking=no -oConnectTimeout=1"
+_CONNECT_SSHOPTS_DEFAULT="-oUserKnownHostsFile=/dev/null -oStrictHostKeyChecking=no -oBatchMode=yes -oPasswordAuthentication=no -oConnectTimeout=20"
+_SSHUTTLECMD_DEFAULT="sshuttle --disable-ipv6 --dns --python python3"
+
+# ###############################
+# global configuration read
+# ###############################
+
+def _load_config() -> dict:
+    for path in _CONFIG_PATHS:
+        if os.path.exists(path):
+            with open(path, "rb") as fp:
+                return json.load(fp)
+    print(
+        "ahoy: config not found.\n"
+        "Copy config.example.json to ~/.config/ahoy/config.json and edit it.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+def _process_config() -> None:
+    d = _load_config()
+    check_sshopts = _CHECK_SSHOPTS_DEFAULT
+    if "checksshopts" in d: check_sshopts = d['checksshopts']
+    connect_sshopts  = _CONNECT_SSHOPTS_DEFAULT
+    if "connectsshopts" in d: connect_sshopts = d['connectsshopts']
+    sshuttlecmd = _SSHUTTLECMD_DEFAULT
+    if "sshuttlecmd" in d: sshuttlecmd = d['sshuttlecmd']
+    sshkey = None
+    if "sshkey" in d: sshkey = d['sshkey']
+    defaultuser = os.environ['USER']
+    if "user" in d: defaultuser = d['user']
+
+    for netname in d['networks'].keys():
+        network=d['networks'][netname]
+        label = netname
+        user  = defaultuser
+        if 'user' in network.keys(): user = network['user']
+        
+        description = 'Selected: %s: %s'%(netname,str(network['nets']))
+        
+        check_cmd = "test -f /tmp/sshuttle.%s.pid &&"%(netname)
+        check_cmd += "ssh " + check_sshopts + " "
+        if sshkey is not None: check_cmd += " -i " + sshkey + " "
+        check_cmd += user + "@" + network["gateway"] + " true"
+        
+        off_cmd = "if test -f /tmp/sshuttle.%s.pid ; "%(netname)
+        off_cmd += "then"
+        off_cmd += "  kill -9 $(cat /tmp/sshuttle.%s.pid) ; "%(netname)
+        off_cmd += "  rm -f /tmp/sshuttle.%s.pid ; "%(netname)
+        off_cmd += "fi"
+        
+        on_cmd = off_cmd + "; "
+        on_cmd += sshuttlecmd + " --daemon --pidfile /tmp/sshuttle.%s.pid "%(netname)
+        on_cmd += "-e 'ssh " + connect_sshopts
+        if sshkey is not None: on_cmd += " -i " + sshkey
+        on_cmd += "' -r " + user + "@" + network["jumphost"] + " "
+        for cidr in network["nets"]: on_cmd += cidr + " "
+
+        item = ToggleItem(label, description, check_cmd, on_cmd, off_cmd)
+        ITEMS.append(item)
+
+# ── model ──────────────────────────────────────────────────
+
+# #####################################
+# model_update_loop runs forever and checks/adjusts the actual states.
+# for each entry the actual state of the entry (connected or disconnected)
+# is verified by running the entry's "check_cmd"
+# #####################################
+
+def model_update_loop() -> None:
+    while True:
+        for item in ITEMS:
+            item.actual  = model_check_state(item)
+            if item.desired is None:
+                item.desired = item.actual
+            if item.actual != item.desired:
+                model_apply_item(item)
+        time.sleep(5)
+
+def model_check_state(item: ToggleItem) -> bool:
+    """Return True (ON) if check_cmd exits 0, False otherwise."""
+    retval = (_run(item.check_cmd) == 0)
+    #_command_log_extend([item.label])
+    #_command_log_extend([item.check_cmd])
+    return retval
+
+def _run(cmd: str) -> int:
+    return subprocess.call(
+        cmd, shell=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+# #####################################
+# model_apply_item is called when a change needs to be made.
+# #####################################
+        
+def model_apply_item(item: ToggleItem) -> None:
+    """Run on_cmd or off_cmd to reach desired state (apply path is logged)."""
+    _run_toggle_apply(item)
+    item.actual = model_check_state(item)
+
+def _run_toggle_apply(item: ToggleItem) -> int:
+    """Run on_cmd or off_cmd per `item.desired`; capture output into `_command_log` and file."""
+    turning_on = bool(item.desired)
+    cmd = item.on_cmd if turning_on else item.off_cmd
+    phase = "ON" if turning_on else "OFF"
+    ts = time.strftime("%H:%M:%S")
+    try:
+        completed = subprocess.run(
+            cmd,
+            shell=True,
+            input="",
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+    except OSError as exc:
+        _command_log_extend(
+            [
+                f"[{ts}] {item.label} → {phase}  (failed to run: {exc})",
+                f"  $ {cmd.strip()[:MAX_CMD_LOG_CHARS]}",
+            ]
+        )
+        return 127
+
+    rc = completed.returncode
+    out = (completed.stdout or "") + (completed.stderr or "")
+    header = f"[{ts}] {item.label} → {phase}  exit {rc}"
+    entries = [header]
+    _command_log_extend(entries)
+    return rc
+
+
+# ###############################
+# logging
+# ###############################
 
 LOG_MAX_LINES = 400
 MAX_CMD_LOG_CHARS = 400
@@ -28,7 +191,6 @@ _command_log_file_warned = False
 def command_log_snapshot() -> list[str]:
     with _command_log_lock:
         return list(_command_log)
-
 
 def _persist_command_log_lines(lines: list[str]) -> None:
     """Append log lines to disk (same content as the on-screen deque)."""
@@ -50,136 +212,20 @@ def _persist_command_log_lines(lines: list[str]) -> None:
             )
             _command_log_file_warned = True
 
-
 def _command_log_extend(entries: list[str]) -> None:
     with _command_log_lock:
         for line in entries:
             _command_log.append(line)
     _persist_command_log_lines(entries)
 
+
 # ── colour pair indices ────────────────────────────────────────────────
+
 CP_ON     = 1   # green  — ON
 CP_OFF    = 2   # red    — OFF
 CP_UNK    = 3   # yellow — unknown / not yet checked
 CP_SYNC   = 4   # green  — desired matches actual
 CP_NOSYNC = 5   # red    — desired differs from actual
-
-
-# ── data model ────────────────────────────────────────────────────────
-
-@dataclass
-class ToggleItem:
-    label: str
-    description: str
-    check_cmd: str                 # shell cmd: exit 0 → ON,  non-zero → OFF
-    on_cmd: str                    # shell cmd: executed to turn ON
-    off_cmd: str                   # shell cmd: executed to turn OFF
-    desired: Optional[bool] = None # None = unset (before startup)
-    actual: Optional[bool] = None  # None = not yet queried
-    message: str = ""              # output from an error
-
-# Edit this list to add your own toggles.
-ITEMS: list[ToggleItem] = []
-
-_CONFIG_PATHS = [
-    os.path.expanduser("~/.config/ahoy/config.json"),
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
-]
-
-def _load_config() -> dict:
-    for path in _CONFIG_PATHS:
-        if os.path.exists(path):
-            with open(path, "rb") as fp:
-                return json.load(fp)
-    print(
-        "ahoy: config not found.\n"
-        "Copy config.example.json to ~/.config/ahoy/config.json and edit it.",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-d = _load_config()
-for netname in d['networks'].keys():
-    network=d['networks'][netname]
-    label = netname
-    description = 'Connect to %s'%(netname)
-    check_cmd = "test -f /tmp/sshuttle.%s.pid && /usr/bin/nc -z -G 1 -w 1 %s 22"%(netname, network["gateway"])
-    on_cmd = d['sshuttlecmd']
-    on_cmd += " --daemon --pidfile /tmp/sshuttle.%s.pid "%(netname)
-    on_cmd += "-e 'ssh " + d['sshoptions'] + " -i " + d['sshkey'] + "' "
-    on_cmd += "-r " + network["jumphost"] + " "
-    for cidr in network["nets"]: on_cmd += cidr + " "
-    off_cmd = "kill -9 $(cat /tmp/sshuttle.%s.pid)"%(netname)
-    item = ToggleItem(label, description, check_cmd, on_cmd, off_cmd)
-    ITEMS.append(item)
-
-# ── model ──────────────────────────────────────────────────
-
-def _run(cmd: str) -> int:
-    return subprocess.call(
-        cmd, shell=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-def _run_toggle_apply(item: ToggleItem) -> int:
-    """Run on_cmd or off_cmd per `item.desired`; capture output into `_command_log` and file."""
-    turning_on = bool(item.desired)
-    cmd = item.on_cmd if turning_on else item.off_cmd
-    phase = "ON" if turning_on else "OFF"
-    ts = time.strftime("%H:%M:%S")
-    try:
-        completed = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            errors="replace",
-        )
-    except OSError as exc:
-        _command_log_extend(
-            [
-                f"[{ts}] {item.label} → {phase}  (failed to run: {exc})",
-                f"  $ {cmd.strip()[:MAX_CMD_LOG_CHARS]}",
-            ]
-        )
-        return 127
-
-    rc = completed.returncode
-    out = (completed.stdout or "") + (completed.stderr or "")
-    header = f"[{ts}] {item.label} → {phase}  exit {rc}"
-    entries = [
-        header,
-        f"  $ {cmd.strip()[:MAX_CMD_LOG_CHARS]}",
-    ]
-    out_lines = out.splitlines()
-    if not out_lines and rc != 0:
-        entries.append("  (no stdout/stderr)")
-    for raw in out_lines:
-        entries.append(f"  | {raw[:MAX_LOG_LINE_CHARS]}")
-    _command_log_extend(entries)
-    return rc
-
-
-def model_check_state(item: ToggleItem) -> bool:
-    """Return True (ON) if check_cmd exits 0, False otherwise."""
-    return _run(item.check_cmd) == 0
-
-def model_update_loop() -> None:
-    while True:
-        for item in ITEMS:
-            item.actual  = model_check_state(item)
-            if item.desired is None:
-                item.desired = item.actual
-            if item.actual != item.desired:
-                model_apply_item(item)
-        time.sleep(1)
-        
-def model_apply_item(item: ToggleItem) -> None:
-    """Run on_cmd or off_cmd to reach desired state (apply path is logged)."""
-    _run_toggle_apply(item)
-    item.actual = model_check_state(item)
 
 # ── layout constants ──────────────────────────────────────────────────
 
@@ -287,7 +333,7 @@ def draw_log(win, lines: list[str]) -> None:
 
 def draw_header(stdscr, cols: int) -> None:
     title = "Ahoy! number, please"
-    hint  = ("SPACE/ENTER: toggle desired q: quit")
+    hint  = ("UP/DOWN to select; SPACE/ENTER to toggle; q to quit")
     try:
         stdscr.addstr(0, max(0, (cols - len(title)) // 2), title,
                       curses.A_BOLD | curses.A_UNDERLINE)
@@ -301,6 +347,8 @@ def draw_header(stdscr, cols: int) -> None:
 
 def main(stdscr) -> None:
 
+    _process_config()
+    
     # start the status updater
     thread = threading.Thread(target=model_update_loop, args=(), daemon=True)
     thread.start()
@@ -385,29 +433,6 @@ def main(stdscr) -> None:
             ITEMS[highlight].desired = not ITEMS[highlight].desired
             state = "ON" if ITEMS[highlight].desired else "OFF"
             log = (f"Desired: '{ITEMS[highlight].label}' → {state}")
-
-        #elif ch == ord('a'):
-        #    item = ITEMS[highlight]
-        #    if item.actual == item.desired:
-        #        log = f"'{item.label}' is already in the desired state."
-        #    else:
-        #        log = f"Applying '{item.label}'…"
-        #        draw_info(info_win, highlight, log)
-        #        log = apply_item(item)
-
-        #elif ch == ord('A'):
-        #    if all(i.actual == i.desired for i in ITEMS):
-        #        log = "All items already in sync."
-        #    else:
-        #        log = "Applying all out-of-sync items…"
-        #        draw_info(info_win, highlight, log)
-        #        log = apply_all()
-
-        #elif ch == ord('r'):
-        #    log = "Refreshing actual states…"
-        #    draw_info(info_win, highlight, log)
-        #    refresh_all()
-        #    log = "Actual states refreshed."
 
         elif ch in (ord('q'), ord('Q')):
             break

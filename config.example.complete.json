@@ -1,0 +1,20 @@
+{
+  "sshkey": "/Users/galmasi/.ssh/id_rsa",
+  "checksshopts": "-oBatchMode=yes -oPasswordAuthentication=no -oUserKnownHostsFile=/dev/null -oStrictHostKeyChecking=no -oConnectTimeout=1 -n",
+  "connectsshopts": "-oUserKnownHostsFile=/dev/null -oStrictHostKeyChecking=no -oBatchMode=yes -oPasswordAuthentication=no -oConnectTimeout=20",
+  "sshuttlecmd": "sshuttle --disable-ipv6 --dns --python python3",
+  "networks": {
+    "31lab": {
+      "user": "user1",
+	    "jumphost": "jumphost1",
+      "gateway": "10.20.0.1",
+	    "nets": [ "10.20.0.0/16", "10.30.0.0/16" ]
+    },
+    "Ykt": {
+      "user": "user2",
+	    "jumphost": "jumphost2",
+      "gateway": "100.64.0.1",
+	    "nets": [ "192.168.16.0/22", "100.64.0.1/16", "10.42.0.0/16" ]
+    }
+  }
+}
